@@ -1,0 +1,17 @@
+{
+  "name": "V&M Études — Suivi de chantiers",
+  "short_name": "V&M Études",
+  "description": "Suivi de chantiers, devis et agenda pour V&M Études",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#EEF1EC",
+  "theme_color": "#2E6E62",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
