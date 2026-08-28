@@ -126,6 +126,19 @@
   .sync-error{font-size:0.74rem;color:#B8434A;margin:0 0 10px;}
   .sync-hint{font-size:0.74rem;color:var(--ink-faint);margin:0 0 16px;}
 
+  .backup-menu-wrap{position:relative;}
+  .backup-menu{
+    position:absolute;top:calc(100% + 4px);left:0;z-index:20;
+    background:var(--surface);border:1px solid #D8DED8;border-radius:8px;box-shadow:var(--shadow);
+    display:flex;flex-direction:column;min-width:150px;overflow:hidden;
+  }
+  .backup-menu button{
+    font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:0.78rem;color:var(--ink);
+    background:none;border:none;padding:9px 12px;text-align:left;cursor:pointer;white-space:nowrap;
+  }
+  .backup-menu button:hover{background:var(--surface-soft);}
+  .backup-menu button + button{border-top:1px solid #ECEFEA;}
+
   .toolbar-actions{display:flex;gap:8px;}
   .btn-export{
     font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:0.85rem;
@@ -918,8 +931,13 @@ function render(){
         ` : `
           <button class="btn-sync btn-google" id="btnGoogleConnect">${googleConnecting ? 'Connexion…' : '🔗 Se connecter avec Google'}</button>
         `}
-        <button class="btn-sync" id="btnBackupExport">💾 Exporter (sauvegarde)</button>
-        <button class="btn-sync" id="btnBackupImport">📥 Importer</button>
+        <div class="backup-menu-wrap">
+          <button class="btn-sync" id="btnBackupMenu">💾 Sauvegarde ▾</button>
+          <div class="backup-menu" id="backupMenu" style="display:none;">
+            <button id="btnBackupExport">💾 Exporter</button>
+            <button id="btnBackupImport">📥 Importer</button>
+          </div>
+        </div>
         <input type="file" id="backupFileInput" accept=".json" style="display:none">
       </div>
     </div>
@@ -959,8 +977,15 @@ function render(){
   if(btnRetry) btnRetry.onclick = retryLoad;
   document.getElementById('navDevis').onclick = () => { appView = 'devis'; render(); };
   document.getElementById('navAgenda').onclick = () => { appView = 'agenda'; render(); };
-  document.getElementById('btnBackupExport').onclick = exportBackup;
-  document.getElementById('btnBackupImport').onclick = () => document.getElementById('backupFileInput').click();
+
+  const backupMenu = document.getElementById('backupMenu');
+  document.getElementById('btnBackupMenu').onclick = (e) => {
+    e.stopPropagation();
+    backupMenu.style.display = backupMenu.style.display==='none' ? 'flex' : 'none';
+  };
+  document.addEventListener('click', () => { backupMenu.style.display = 'none'; }, {once:true});
+  document.getElementById('btnBackupExport').onclick = () => { backupMenu.style.display='none'; exportBackup(); };
+  document.getElementById('btnBackupImport').onclick = () => { backupMenu.style.display='none'; document.getElementById('backupFileInput').click(); };
   const btnGoogleConnect = document.getElementById('btnGoogleConnect');
   if(btnGoogleConnect) btnGoogleConnect.onclick = connectGoogle;
   const btnGoogleDisconnect = document.getElementById('btnGoogleDisconnect');
