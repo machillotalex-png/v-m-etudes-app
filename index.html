@@ -110,6 +110,13 @@
     padding:6px 10px;cursor:pointer;white-space:nowrap;
   }
   .btn-sync:hover{border-color:var(--line);color:var(--line);}
+  .btn-google{background:var(--ink);color:#fff;border-color:var(--ink);}
+  .btn-google:hover{color:#fff;border-color:var(--ink);opacity:0.9;}
+  .google-status{
+    font-family:'JetBrains Mono',monospace;font-size:0.74rem;color:var(--dv-fait);
+    display:flex;align-items:center;padding:0 4px;
+  }
+  .sync-error{font-size:0.74rem;color:#B8434A;margin:0 0 10px;}
   .sync-hint{font-size:0.74rem;color:var(--ink-faint);margin:0 0 16px;}
 
   .toolbar-actions{display:flex;gap:8px;}
@@ -291,6 +298,7 @@
   .agenda-head{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:12px;}
   .agenda-head h2{font-family:'Space Grotesk',sans-serif;font-size:1.05rem;margin:0;}
   .agenda-nav{display:flex;align-items:center;gap:8px;}
+  .agenda-head-right{display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
   .agenda-nav .icon-btn{
     background:var(--surface);border:1px solid #DCE1DC;border-radius:6px;
     width:28px;height:28px;justify-content:center;font-size:1rem;
@@ -317,7 +325,13 @@
   }
   .agenda-cell-out{background:var(--surface-soft);}
   .agenda-cell-today{box-shadow:inset 0 0 0 2px var(--accent);}
-  .agenda-daynum{font-family:'JetBrains Mono',monospace;font-size:0.68rem;color:var(--ink-faint);margin-bottom:3px;}
+  .agenda-cell-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;}
+  .agenda-daynum{font-family:'JetBrains Mono',monospace;font-size:0.68rem;color:var(--ink-faint);}
+  .agenda-add-btn{
+    background:none;border:none;color:var(--ink-faint);font-size:0.85rem;line-height:1;cursor:pointer;
+    padding:0 2px;border-radius:4px;
+  }
+  .agenda-add-btn:hover{background:var(--accent-soft);color:var(--accent);}
   .agenda-chips{display:flex;flex-direction:column;gap:2px;}
   .agenda-chip{
     font-size:0.6rem;font-family:'JetBrains Mono',monospace;padding:1px 4px;border-radius:3px;
@@ -327,10 +341,11 @@
   .agenda-chip.st-en_cours{background:var(--st-cours-soft);color:var(--st-cours);}
   .agenda-chip.st-en_attente{background:var(--st-attente-soft);color:var(--st-attente);}
   .agenda-chip.st-termine{background:var(--st-termine-soft);color:var(--st-termine);}
+  .agenda-chip-rdv{background:var(--accent-soft);color:var(--accent);font-weight:500;}
   .agenda-more{font-size:0.58rem;color:var(--ink-faint);padding-left:2px;}
   .agenda-legend{
     display:flex;gap:16px;margin-top:8px;font-size:0.7rem;color:var(--ink-faint);
-    font-family:'JetBrains Mono',monospace;
+    font-family:'JetBrains Mono',monospace;flex-wrap:wrap;
   }
 
   @media(max-width:600px){
@@ -410,6 +425,7 @@
 <div id="devisPrintArea"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
 // Storage adapter: uses Claude's persistent window.storage when available (e.g. when the
 // file is opened from inside Claude — shared between Alexis & Yoann). When the file is
@@ -442,10 +458,183 @@ const localStorageAdapter = {
 
 const storageAPI = hasCloudStorage ? window.storage : localStorageAdapter;
 
+// ---------- Google Drive sync ----------
+// Real-time sharing between Alexis & Yoann: once connected, the whole app's
+// data lives in one JSON file in Google Drive. Whoever connects first creates
+// it; they then share that file (via Drive's own sharing) with the other
+// person's Google account so both apps can find and update it.
+const GOOGLE_CLIENT_ID = '516047078700-8mggacktu8kmnttp0riapkr6n5354ptl.apps.googleusercontent.com';
+const GOOGLE_SCOPES = 'https://www.googleapis.com/auth/drive';
+const DRIVE_FILENAME = 'vm-etudes-data.json';
+
+let googleTokenClient = null;
+let googleAccessToken = null;
+let googleDriveFileId = null;
+let googleUserEmail = null;
+let googleConnecting = false;
+let googleLastSyncError = null;
+
+function waitForGoogleLib(cb, tries=40){
+  if(window.google && window.google.accounts && window.google.accounts.oauth2){ cb(); return; }
+  if(tries<=0) return;
+  setTimeout(()=>waitForGoogleLib(cb, tries-1), 250);
+}
+
+function initGoogleClient(){
+  googleTokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GOOGLE_CLIENT_ID,
+    scope: GOOGLE_SCOPES,
+    callback: async (resp) => {
+      if(resp.error){
+        googleLastSyncError = "Connexion refusée ou annulée.";
+        googleConnecting = false;
+        render();
+        return;
+      }
+      googleAccessToken = resp.access_token;
+      await connectToDriveAfterAuth();
+    }
+  });
+}
+
+function connectGoogle(){
+  if(!googleTokenClient){
+    alert("Le module Google n'a pas pu se charger. Vérifie ta connexion internet et réessaie dans quelques secondes.");
+    return;
+  }
+  googleConnecting = true;
+  googleLastSyncError = null;
+  render();
+  googleTokenClient.requestAccessToken({prompt:'consent'});
+}
+
+function disconnectGoogle(){
+  if(googleAccessToken && window.google && google.accounts && google.accounts.oauth2){
+    google.accounts.oauth2.revoke(googleAccessToken, ()=>{});
+  }
+  googleAccessToken = null;
+  googleDriveFileId = null;
+  googleUserEmail = null;
+  render();
+}
+
+async function driveApiFetch(url, options={}){
+  const res = await fetch(url, {
+    ...options,
+    headers: { ...(options.headers||{}), 'Authorization': 'Bearer ' + googleAccessToken },
+  });
+  if(res.status===401){
+    googleAccessToken = null;
+    throw new Error("La session Google a expiré, reconnecte-toi.");
+  }
+  if(!res.ok){
+    throw new Error('Erreur Google Drive (' + res.status + ')');
+  }
+  return res;
+}
+
+async function fetchGoogleUserEmail(){
+  try{
+    const res = await driveApiFetch('https://www.googleapis.com/oauth2/v3/userinfo');
+    const info = await res.json();
+    googleUserEmail = info.email || null;
+  }catch(e){ googleUserEmail = null; }
+}
+
+function buildSnapshot(){
+  const media = {};
+  chantiers.forEach(c=>{ media[c.id] = mediaCache[c.id] || {photos:[], documents:[]}; });
+  return {
+    exportedAt: new Date().toISOString(),
+    chantiers, counters, devisListData, devisCounter, rdvListData, media,
+  };
+}
+
+function applySnapshot(snapshot){
+  chantiers = snapshot.chantiers || [];
+  counters = snapshot.counters || {topo:0, detection:0, amo:0};
+  devisListData = snapshot.devisListData || [];
+  devisCounter = snapshot.devisCounter || 0;
+  rdvListData = snapshot.rdvListData || [];
+  mediaCache = snapshot.media || {};
+}
+
+async function findOrCreateDriveFile(){
+  const q = encodeURIComponent(`name = '${DRIVE_FILENAME}' and trashed = false`);
+  const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)&spaces=drive`);
+  const data = await res.json();
+  if(data.files && data.files.length>0){
+    googleDriveFileId = data.files[0].id;
+    return;
+  }
+  const metaRes = await driveApiFetch('https://www.googleapis.com/drive/v3/files', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name: DRIVE_FILENAME, mimeType:'application/json'}),
+  });
+  const meta = await metaRes.json();
+  googleDriveFileId = meta.id;
+  await driveWriteContent(buildSnapshot());
+}
+
+async function driveWriteContent(snapshot){
+  if(!googleDriveFileId) return;
+  await driveApiFetch(`https://www.googleapis.com/upload/drive/v3/files/${googleDriveFileId}?uploadType=media`, {
+    method:'PATCH',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(snapshot),
+  });
+}
+
+async function driveReadContent(){
+  if(!googleDriveFileId) return null;
+  const res = await driveApiFetch(`https://www.googleapis.com/drive/v3/files/${googleDriveFileId}?alt=media`);
+  const text = await res.text();
+  if(!text) return null;
+  try{ return JSON.parse(text); }catch(e){ return null; }
+}
+
+async function connectToDriveAfterAuth(){
+  googleConnecting = true;
+  render();
+  try{
+    await fetchGoogleUserEmail();
+    for(const c of chantiers){ await loadMedia(c.id); }
+    await findOrCreateDriveFile();
+    const remote = await driveReadContent();
+    if(remote && Array.isArray(remote.chantiers)){
+      applySnapshot(remote);
+    }else{
+      await driveWriteContent(buildSnapshot());
+    }
+    googleLastSyncError = null;
+  }catch(e){
+    console.error('Erreur de connexion Drive', e);
+    googleLastSyncError = e.message || String(e);
+    googleAccessToken = null;
+  }
+  googleConnecting = false;
+  loading = false;
+  render();
+}
+
+async function syncToDriveIfConnected(){
+  if(!googleAccessToken || !googleDriveFileId) return;
+  try{
+    await driveWriteContent(buildSnapshot());
+    googleLastSyncError = null;
+  }catch(e){
+    console.error('Erreur de synchronisation Drive', e);
+    googleLastSyncError = e.message || String(e);
+  }
+}
+
+
 const STORAGE_KEY = 'chantiers-list';
 const COUNTERS_KEY = 'chantiers-counters';
 const DEVIS_KEY = 'devis-list';
 const DEVIS_COUNTER_KEY = 'devis-counter';
+const RDV_KEY = 'rdv-list';
 const STATUTS = [
   {id:'a_planifier', label:'À planifier'},
   {id:'en_cours', label:'En cours'},
@@ -491,6 +680,8 @@ let appView = 'chantiers'; // 'chantiers' | 'devis'
 let devisListData = [];
 let devisCounter = 0;
 let devisModalState = null; // {mode:'new'|'edit', data:{...}}
+let rdvListData = [];
+let rdvModalState = null; // {mode:'new'|'edit', data:{...}}
 let agendaDate = (() => { const d = new Date(); d.setDate(1); return d; })();
 let modalState = null; // {mode:'new'|'edit', data:{...}}
 let loading = true;
@@ -532,6 +723,9 @@ async function loadAll(){
   const r4 = await safeStorageGet(DEVIS_COUNTER_KEY);
   devisCounter = r4.value ? JSON.parse(r4.value) : 0;
 
+  const r5 = await safeStorageGet(RDV_KEY);
+  rdvListData = r5.value ? JSON.parse(r5.value) : [];
+
   loading = false;
   render();
 }
@@ -552,7 +746,7 @@ async function exportBackup(){
 
   const snapshot = {
     exportedAt: new Date().toISOString(),
-    chantiers, counters, devisListData, devisCounter, media,
+    chantiers, counters, devisListData, devisCounter, rdvListData, media,
   };
 
   const blob = new Blob([JSON.stringify(snapshot)], {type:'application/json'});
@@ -589,12 +783,14 @@ function importBackup(file){
     counters = snapshot.counters || {topo:0, detection:0, amo:0};
     devisListData = snapshot.devisListData || [];
     devisCounter = snapshot.devisCounter || 0;
+    rdvListData = snapshot.rdvListData || [];
     mediaCache = snapshot.media || {};
 
     await saveList();
     await storageAPI.set(COUNTERS_KEY, JSON.stringify(counters), true);
     await saveDevisList();
     await storageAPI.set(DEVIS_COUNTER_KEY, JSON.stringify(devisCounter), true);
+    await saveRdvList();
     for(const id of Object.keys(mediaCache)){
       await storageAPI.set('chantier-media:'+id, JSON.stringify(mediaCache[id]), true);
     }
@@ -618,6 +814,14 @@ async function saveDevisList(){
   try{
     await storageAPI.set(DEVIS_KEY, JSON.stringify(devisListData), true);
   }catch(e){ console.error('Erreur de sauvegarde devis', e); }
+  await syncToDriveIfConnected();
+}
+
+async function saveRdvList(){
+  try{
+    await storageAPI.set(RDV_KEY, JSON.stringify(rdvListData), true);
+  }catch(e){ console.error('Erreur de sauvegarde des rendez-vous', e); }
+  await syncToDriveIfConnected();
 }
 
 async function nextNumero(typeId){
@@ -633,6 +837,7 @@ async function saveList(){
   try{
     await storageAPI.set(STORAGE_KEY, JSON.stringify(chantiers), true);
   }catch(e){ console.error('Erreur de sauvegarde', e); }
+  await syncToDriveIfConnected();
 }
 
 async function loadMedia(id){
@@ -651,7 +856,9 @@ async function saveMedia(id, media){
   try{
     await storageAPI.set('chantier-media:'+id, JSON.stringify(media), true);
   }catch(e){ console.error('Erreur sauvegarde médias', e); }
+  await syncToDriveIfConnected();
 }
+
 
 function fmtDate(d){
   if(!d) return '—';
@@ -685,16 +892,25 @@ function render(){
       <div class="main-nav">
         <button class="main-nav-tab ${appView==='chantiers'?'active':''}" id="navChantiers">Chantiers</button>
         <button class="main-nav-tab ${appView==='devis'?'active':''}" id="navDevis">Devis</button>
+        <button class="main-nav-tab ${appView==='agenda'?'active':''}" id="navAgenda">Agenda</button>
       </div>
       <div class="sync-actions">
+        ${googleAccessToken ? `
+          <span class="google-status">🟢 ${googleUserEmail ? escapeHtml(googleUserEmail) : 'Connecté'}</span>
+          <button class="btn-sync" id="btnGoogleDisconnect">Déconnecter</button>
+        ` : `
+          <button class="btn-sync btn-google" id="btnGoogleConnect">${googleConnecting ? 'Connexion…' : '🔗 Se connecter avec Google'}</button>
+        `}
         <button class="btn-sync" id="btnBackupExport">💾 Exporter (sauvegarde)</button>
         <button class="btn-sync" id="btnBackupImport">📥 Importer</button>
         <input type="file" id="backupFileInput" accept=".json" style="display:none">
       </div>
     </div>
-    ${isLocalFallback ? `<p class="sync-hint">Pour partager avec Yoann : exporte, dépose le fichier dans un dossier Google Drive partagé, puis fais-lui importer ce fichier (et inversement à chaque mise à jour).</p>` : ''}
+    ${googleLastSyncError ? `<p class="sync-error">⚠ ${escapeHtml(googleLastSyncError)}</p>` : ''}
+    ${googleAccessToken ? `<p class="sync-hint">Synchronisé via Google Drive. La première fois, pense à partager le fichier « ${DRIVE_FILENAME} » (créé dans ton Drive) avec le compte Google de Yoann pour qu'il voie les mêmes données.</p>` :
+      isLocalFallback ? `<p class="sync-hint">Pour partager avec Yoann : exporte, dépose le fichier dans un dossier Google Drive partagé, puis fais-lui importer ce fichier (et inversement à chaque mise à jour).</p>` : ''}
 
-    ${appView==='devis' ? devisSectionHtml() : `
+    ${appView==='devis' ? devisSectionHtml() : appView==='agenda' ? agendaSectionHtml() : `
     <div class="toolbar">
       <div class="tabs">
         <div class="tab ${filterStatut==='tous'?'active':''}" data-filter="tous">TOUS · ${pool.length}</div>
@@ -718,9 +934,6 @@ function render(){
         list.map(c=>cardHtml(c)).join('')
       }
     </div>
-
-    <div class="chaining"></div>
-    ${agendaHtml()}
     `}
   `;
 
@@ -728,8 +941,13 @@ function render(){
   const btnRetry = document.getElementById('btnRetryLoad');
   if(btnRetry) btnRetry.onclick = retryLoad;
   document.getElementById('navDevis').onclick = () => { appView = 'devis'; render(); };
+  document.getElementById('navAgenda').onclick = () => { appView = 'agenda'; render(); };
   document.getElementById('btnBackupExport').onclick = exportBackup;
   document.getElementById('btnBackupImport').onclick = () => document.getElementById('backupFileInput').click();
+  const btnGoogleConnect = document.getElementById('btnGoogleConnect');
+  if(btnGoogleConnect) btnGoogleConnect.onclick = connectGoogle;
+  const btnGoogleDisconnect = document.getElementById('btnGoogleDisconnect');
+  if(btnGoogleDisconnect) btnGoogleDisconnect.onclick = disconnectGoogle;
   document.getElementById('backupFileInput').onchange = (e) => {
     const file = e.target.files[0];
     if(file) importBackup(file);
@@ -739,6 +957,12 @@ function render(){
   if(appView==='devis'){
     bindDevisSectionEvents();
     if(devisModalState) renderDevisModal();
+    return;
+  }
+
+  if(appView==='agenda'){
+    bindAgendaSectionEvents();
+    if(rdvModalState) renderRdvModal();
     return;
   }
 
@@ -809,7 +1033,7 @@ function toDateStr(d){
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
 
-function agendaHtml(){
+function agendaSectionHtml(){
   const year = agendaDate.getFullYear();
   const month = agendaDate.getMonth();
   const firstOfMonth = new Date(year, month, 1);
@@ -828,17 +1052,23 @@ function agendaHtml(){
     const starting = chantiers.filter(c=>!c.archived && c.dateDebut===dateStr);
     const ending = chantiers.filter(c=>!c.archived && c.dateFin===dateStr && c.dateFin!==c.dateDebut);
     const ongoing = chantiers.filter(c=>!c.archived && c.dateDebut && c.dateFin && c.dateDebut < dateStr && dateStr < c.dateFin);
+    const rdvs = rdvListData.filter(r=>r.date===dateStr).sort((a,b)=>(a.heure||'').localeCompare(b.heure||''));
 
     const chips = [
+      ...rdvs.map(r=>rdvChipHtml(r)),
       ...starting.map(c=>chipHtml(c,'▶')),
       ...ending.map(c=>chipHtml(c,'■')),
       ...ongoing.slice(0, Math.max(0,3-starting.length-ending.length)).map(c=>chipHtml(c,'·')),
-    ].slice(0,3);
-    const extra = (starting.length+ending.length+ongoing.length) - chips.length;
+    ].slice(0,4);
+    const totalCount = rdvs.length + starting.length + ending.length + ongoing.length;
+    const extra = totalCount - chips.length;
 
     cells.push(`
       <div class="agenda-cell ${inMonth?'':'agenda-cell-out'} ${isToday?'agenda-cell-today':''}">
-        <div class="agenda-daynum">${dayNum>=1 && dayNum<=daysInMonth ? dayNum : ''}</div>
+        <div class="agenda-cell-head">
+          <div class="agenda-daynum">${dayNum>=1 && dayNum<=daysInMonth ? dayNum : ''}</div>
+          ${inMonth ? `<button class="agenda-add-btn" data-date="${dateStr}" title="Ajouter un rendez-vous">+</button>` : ''}
+        </div>
         <div class="agenda-chips">
           ${chips.join('')}
           ${extra>0 ? `<div class="agenda-more">+${extra}</div>` : ''}
@@ -851,11 +1081,14 @@ function agendaHtml(){
     <div class="agenda-section">
       <div class="agenda-head">
         <h2>Agenda</h2>
-        <div class="agenda-nav">
-          <button class="icon-btn" id="agendaPrev">‹</button>
-          <span class="agenda-month">${MOIS_FR[month]} ${year}</span>
-          <button class="icon-btn" id="agendaNext">›</button>
-          <button class="agenda-today-btn" id="agendaToday">Aujourd'hui</button>
+        <div class="agenda-head-right">
+          <div class="agenda-nav">
+            <button class="icon-btn" id="agendaPrev">‹</button>
+            <span class="agenda-month">${MOIS_FR[month]} ${year}</span>
+            <button class="icon-btn" id="agendaNext">›</button>
+            <button class="agenda-today-btn" id="agendaToday">Aujourd'hui</button>
+          </div>
+          <button class="btn-new" id="btnNewRdv">+ Nouveau RDV</button>
         </div>
       </div>
       <div class="agenda-grid">
@@ -863,14 +1096,142 @@ function agendaHtml(){
         ${cells.join('')}
       </div>
       <div class="agenda-legend">
-        <span>▶ début</span><span>■ fin</span><span>· en cours</span>
+        <span>▶ début chantier</span><span>■ fin chantier</span><span>· en cours</span><span>🕐 rendez-vous</span>
       </div>
     </div>
   `;
 }
 
+function bindAgendaSectionEvents(){
+  document.getElementById('agendaPrev').onclick = () => { agendaDate.setMonth(agendaDate.getMonth()-1); render(); };
+  document.getElementById('agendaNext').onclick = () => { agendaDate.setMonth(agendaDate.getMonth()+1); render(); };
+  document.getElementById('agendaToday').onclick = () => { agendaDate = (()=>{const d=new Date(); d.setDate(1); return d;})(); render(); };
+  document.getElementById('btnNewRdv').onclick = () => openRdvModal('new', toDateStr(new Date()));
+
+  app.querySelectorAll('.agenda-add-btn').forEach(btn=>{
+    btn.onclick = (e) => { e.stopPropagation(); openRdvModal('new', btn.dataset.date); };
+  });
+
+  app.querySelectorAll('.agenda-chip').forEach(el=>{
+    el.onclick = (e) => {
+      e.stopPropagation();
+      if(el.dataset.kind==='rdv'){
+        const r = rdvListData.find(x=>x.id===el.dataset.id);
+        if(r) openRdvModal('edit', null, r);
+      }else{
+        const c = chantiers.find(x=>x.id===el.dataset.id);
+        if(c) openModal('edit', c);
+      }
+    };
+  });
+}
+
 function chipHtml(c, marker){
-  return `<div class="agenda-chip st-${c.statut}" data-id="${c.id}" title="${escapeHtml(c.numero||'')} — ${escapeHtml(c.nom)}">${marker} ${escapeHtml(c.numero||c.nom)}</div>`;
+  return `<div class="agenda-chip st-${c.statut}" data-kind="chantier" data-id="${c.id}" title="${escapeHtml(c.numero||'')} — ${escapeHtml(c.nom)}">${marker} ${escapeHtml(c.numero||c.nom)}</div>`;
+}
+
+function rdvChipHtml(r){
+  const label = (r.heure ? r.heure+' ' : '') + r.titre;
+  return `<div class="agenda-chip agenda-chip-rdv" data-kind="rdv" data-id="${r.id}" title="${escapeHtml(label)}">🕐 ${escapeHtml(label)}</div>`;
+}
+
+// ---------- RDV (rendez-vous) ----------
+
+function openRdvModal(mode, dateStr, rdv){
+  const data = mode==='new' ? {
+    id: uid(), titre:'', date: dateStr || toDateStr(new Date()), heure:'', chantierId:'', notes:''
+  } : JSON.parse(JSON.stringify(rdv));
+  rdvModalState = {mode, data};
+  renderRdvModal();
+}
+
+function closeRdvModal(){
+  rdvModalState = null;
+  const old = document.querySelector('.overlay');
+  if(old) old.remove();
+}
+
+function renderRdvModal(){
+  let old = document.querySelector('.overlay');
+  if(old) old.remove();
+  const {mode, data} = rdvModalState;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'overlay';
+  overlay.innerHTML = `
+    <div class="modal">
+      <div class="modal-head">
+        <h2>${mode==='new' ? 'Nouveau rendez-vous' : 'Détail du rendez-vous'}</h2>
+        <button class="icon-btn" id="rClose">✕</button>
+      </div>
+
+      <label>Titre</label>
+      <input type="text" id="rTitre" value="${escapeHtml(data.titre)}" placeholder="Ex. RDV client, visite de site…">
+
+      <div class="row2">
+        <div>
+          <label>Date</label>
+          <input type="date" id="rDate" value="${data.date||''}">
+        </div>
+        <div>
+          <label>Heure (facultatif)</label>
+          <input type="time" id="rHeure" value="${data.heure||''}">
+        </div>
+      </div>
+
+      <label>Chantier associé (facultatif)</label>
+      <select id="rChantier">
+        <option value="">Aucun</option>
+        ${chantiers.map(c=>`<option value="${c.id}" ${data.chantierId===c.id?'selected':''}>${escapeHtml(c.numero)} — ${escapeHtml(c.nom)}</option>`).join('')}
+      </select>
+
+      <label>Notes</label>
+      <textarea id="rNotes" placeholder="Précisions, lieu, contact…">${escapeHtml(data.notes||'')}</textarea>
+
+      <div class="modal-actions">
+        ${mode==='edit' ? `<button class="btn-danger" id="rDelete">Supprimer</button>` : ''}
+        <button class="btn-primary" id="rSave">${mode==='new' ? 'Créer le rendez-vous' : 'Enregistrer'}</button>
+      </div>
+      <div class="saving-note">Visible par Alexis et Yoann</div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  overlay.onclick = (e) => { if(e.target===overlay) closeRdvModal(); };
+  document.getElementById('rClose').onclick = closeRdvModal;
+
+  document.getElementById('rSave').onclick = async () => {
+    data.titre = document.getElementById('rTitre').value.trim() || 'Rendez-vous';
+    data.date = document.getElementById('rDate').value;
+    data.heure = document.getElementById('rHeure').value;
+    data.chantierId = document.getElementById('rChantier').value;
+    data.notes = document.getElementById('rNotes').value.trim();
+
+    if(!data.date){
+      alert('Merci de renseigner une date.');
+      return;
+    }
+
+    if(mode==='new'){
+      rdvListData.unshift(data);
+    }else{
+      const idx = rdvListData.findIndex(r=>r.id===data.id);
+      rdvListData[idx] = data;
+    }
+    await saveRdvList();
+    closeRdvModal();
+    render();
+  };
+
+  if(mode==='edit'){
+    document.getElementById('rDelete').onclick = async () => {
+      if(!confirm('Supprimer ce rendez-vous ?')) return;
+      rdvListData = rdvListData.filter(r=>r.id!==data.id);
+      await saveRdvList();
+      closeRdvModal();
+      render();
+    };
+  }
 }
 
 function escapeHtml(s){
@@ -1608,6 +1969,7 @@ loadAll().then(()=>{
   // preload media counts for visible cards
   chantiers.forEach(c => loadMedia(c.id).then(()=>render()));
 });
+waitForGoogleLib(initGoogleClient);
 </script>
 </body>
 </html>
